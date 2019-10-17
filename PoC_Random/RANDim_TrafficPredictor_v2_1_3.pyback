@@ -1,0 +1,1710 @@
+import csv
+import os
+import scipy
+import patsy
+#from matplotlib import pyplot
+import math
+#import enetsdk as Enet
+import time
+import sys
+from datetime import datetime
+import scipy as scp
+import numpy as np
+import pandas as pd #Use Pandas < 0.24.0
+import csonexpsmoothing as exps
+import csonstldecompose as stl_decomp
+from csonstldecompose.forecast_funcs import (naive,
+                                            drift,
+                                            mean,
+                                            seasonal_naive)
+import warnings
+warnings.filterwarnings("ignore")
+# from statsmodels.api import holtwinters as exps
+# import ruptures as rp  #: library to detect break points in ts (python 3!)
+from itertools import izip
+
+__author__ = "tony.daher@orange.com>"
+__version__ = "2.1.2"   #with manual seasonality and intensite format + fit only mode from cache or input file
+                        #bug fix: negative Input Trend % accepted + keep empty if no fit needed (instead of 0.0 in previous version
+                        #bug fix: if VRM source or target is null, no fit applied and warning message appears in log
+                        #bug fix: manual seasonality detection bug fix concerning null average traffic in seasonality period in history
+                        #adapted for older pandas versions
+
+__offline_mode__ = False
+
+
+class Model:
+
+    def __init__(self, trained_model, name, model_test, model_train, model_forecast, smry, perf):
+        self.model = trained_model
+        self.model_name = name
+        self.model_test = model_test
+        self.model_train = model_train
+        self.model_forecast = model_forecast
+        self.smry = smry
+        self.perf = perf
+        self.criterion = None
+
+
+def merge(forecast, forecast_tr, forecast_week_index_list, input_season_week_range):#merges 2 forecasts in range input_season_week_range
+
+    forecast.index = forecast_week_index_list
+    forecast_tr.index = forecast_week_index_list
+
+    ## Find Input Seasonality Weeks: Test on ETE
+    merged_forecast = forecast
+    for i, v in merged_forecast.iteritems():
+        # if i[5:7] == "29" or i[5:7] == "30" or i[5:7] == "31" or i[5:7] == "32":
+        if int(i[5:7]) in input_season_week_range:  # list of week number in int
+            merged_forecast.loc[i] = forecast_tr.loc[i]
+
+    return merged_forecast
+
+
+def adapt_intensity(avg_seas_Nm1, forecast_model, forecast_years, input_season_week_range, input_season_intensity):
+    # Verifies that manual seasonality growth is always below a max intensity parameter: input_season_intensity
+
+    avg_seas_ref = avg_seas_Nm1
+    for y in forecast_years:
+
+        if str(y) + 'S' + str(input_season_week_range[0]) in forecast_model.index and str(y) + 'S' + str(
+                input_season_week_range[-1]) in forecast_model.index:
+
+            subseries_season = forecast_model.loc[generate_week_index(str(y) + 'S' + str(input_season_week_range[0]),
+                                                                      1 + input_season_week_range[-1] -
+                                                                      input_season_week_range[0], True)]
+            avg_seas = subseries_season.sum() / len(subseries_season)
+
+            # avg_seas = avg_seas + [subseries_season.sum() / len(subseries_season)]
+            if avg_seas > 0:
+                #function mode that verifies if in line with max intensity:
+                if avg_seas / avg_seas_ref > (1 + float(input_season_intensity) / 100):
+                    fit_ratio = avg_seas_ref * (1 + float(input_season_intensity) / 100) / avg_seas
+                    avg_seas = avg_seas_ref * (1 + float(input_season_intensity) / 100)
+                    # apply intensity correction
+                    for i, v in forecast_model.iteritems():
+                        for week_no in input_season_week_range:
+                            if i == str(y) + 'S' + str(week_no):
+                                forecast_model.loc[i] = v * fit_ratio
+
+                avg_seas_ref = avg_seas
+
+    return forecast_model
+
+'''
+def adapt_intensity_v2(avg_seas_Nm1, forecast_model, forecast_years, input_season_week_range, input_season_intensity):
+    # An improvement of adapt_intensity that does the following:
+        # check if seasonlaity is peak or valley
+        # if input_season_intensity > 0: Verifies that manual seasonality growth is always below a max intensity parameter: input_season_intensity
+        # if input_season_intensity < 0: Verifies that manual seasonality growth is always above a min intensity parameter: input_season_intensity
+        # if input season_intensity == 0 and valley: verifies that manual seasonality grow is never above 0
+        # if input season_intensity == 0 and peak: verifies that manual seasonality grow is never below 0
+'''
+
+def check_peak(df, year, input_season_week_range, range, season_avg): #range minimum = 2
+
+    avg_pre_subseries_season = 0
+    avg_post_subseries_season = 0
+
+    if input_season_week_range[0] - range > 0  and str(year) + 'S' + str(input_season_week_range[0]) in df.index:
+        pre_subseries_season = df['Traffic'].loc[str(year) + 'S' + str(input_season_week_range[0] - range):
+                                                    str(year) + 'S' + str(input_season_week_range[0] - 1)]
+        avg_pre_subseries_season = pre_subseries_season.sum() / len(pre_subseries_season)
+
+    if input_season_week_range[-1] + range < 53  and str(year) + 'S' + str(input_season_week_range[-1]) in df.index:
+        post_subseries_season = df['Traffic'].loc[str(year) + 'S' + str(input_season_week_range[-1] + 1):
+                                                    str(year) + 'S' + str(input_season_week_range[-1] + range)]
+        avg_post_subseries_season = post_subseries_season.sum() / len(post_subseries_season)
+
+    season_surrounding_avg = 0
+    if avg_pre_subseries_season > 0 and avg_post_subseries_season > 0:
+        season_surrounding_avg =  (avg_pre_subseries_season + avg_post_subseries_season)/2
+    elif avg_pre_subseries_season > 0:
+        season_surrounding_avg = avg_pre_subseries_season
+    elif avg_post_subseries_season > 0:
+        season_surrounding_avg = avg_post_subseries_season
+
+    if season_surrounding_avg == 0:
+        return -1
+    elif season_surrounding_avg > season_avg:
+        return False
+    elif season_surrounding_avg <= season_avg:
+        return True
+
+
+def extract_df(df, CODE_NIDT):
+    # with sais typ and intensity format
+    #print(CODE_NIDT)
+    df_target = df[df['ENODEB'] == CODE_NIDT]
+    success = True
+
+    df_target['SAIS_TYP'].fillna('', inplace=True)
+    df_target['INTENSITE'].fillna('', inplace=True)
+    df_target.fillna(0, inplace=True)
+
+    input_seasonality = df_target.iloc[0]['SAIS_TYP']
+    input_season_intensity = df_target.iloc[0]['INTENSITE']
+
+    if len(df_target.index) > 1:
+        print("WARNING: duplicated entry in input file: " + CODE_NIDT)
+        success = False
+
+    df_target = remove_W53(df_target)
+    first_hist_week = df_target.columns[3]
+    last_hist_week = df_target.columns[len(df_target.columns) - 1]
+    hist_len = len(df_target.columns) - 3
+    df_target = df_target.T
+
+    return success, df_target.drop(df_target.index[0:3]), hist_len, first_hist_week, last_hist_week, input_seasonality, input_season_intensity
+
+
+def start_weekday_tune(first_hist_week, last_hist_week):
+
+    #http://strftime.org/
+
+    #%w	Weekday as a decimal number, where 0 is Sunday and 6 is Saturday.
+
+    #%W	Week number of the year (Monday as the first day of the week) as a decimal number. All days in a new year
+    #preceding the first Monday are considered to be in week 0.
+
+    #returns monday by default
+
+    first_hist_year = int(first_hist_week[0:4])
+    last_hist_year = int(last_hist_week[0:4])
+    hist_forecast_years = range(first_hist_year, last_hist_year + 1 + 0, 1) #no considering forecast year range
+    singular_year = -1
+    if len(hist_forecast_years) == 1:
+        return 1 #1 is monday
+    else:
+        for i in range(1,8,1):
+            tuned = True
+            d = i%7
+            for y in hist_forecast_years:
+                x = pd.to_datetime(str(y) + 'S53-' + str(d), format='%YS%W-%w')
+                if x.year == y:
+                    tuned = False
+                    singular_year = y + 1
+                    break
+            if tuned:
+                break
+
+    return d, singular_year
+
+
+def generate_datetime_index(weeks_list, sing_day, sing_year):
+
+    #temp_datetime = pd.to_datetime(df_target.Date.astype(str).add('-' + str(sing_day)), format='%YS%W-%w')
+    temp_datetime = pd.to_datetime(weeks_list, format='%YS%W-%w')
+    for i, v in temp_datetime.iteritems():
+        if v.year == sing_year:
+            temp_datetime.loc[i] = v - pd.Timedelta(weeks=1)
+    temp2_datetime = pd.Series(index = temp_datetime.index)
+    for i, v in temp_datetime.iteritems():
+        temp2_datetime.loc[i] = str(v.day) + '/' + str(v.month) + '/' + str(v.year)
+
+    return pd.to_datetime(temp2_datetime.astype(str), format='%d/%m/%Y')
+
+
+def find_VRM(df, m, y): #VRM: valeur representative mensuelle: returns 0 if year and month not in final data time index
+
+    '''
+    VRMs_list = []
+    for i, row in df.iterrows():
+        VRM_list = []
+        for i, v in row.iteritems():
+            if i.month == int(m) and i.year == int(y):
+                VRM_list = VRM_list + [v]
+
+        if len(VRM_list) < 2:
+            print("ERROR: check month and year for trend reference")
+            sys.exit()
+
+        count = 0
+        m1 = m2 = -1
+        for x in VRM_list:
+            count += 1
+            if x > m2:
+                if x >= m1:
+                    m1, m2 = x, m1
+                else:
+                    m2 = x
+
+        VRM = m2
+        VRMs_list = VRMs_list + [VRM]
+
+    return VRMs_list
+    '''
+
+    VRM_list = []
+    sum_df = df.sum()
+    for index, value in sum_df.iteritems():
+        if index.month == m and index.year == y:
+            VRM_list = VRM_list + [value]
+
+    if len(VRM_list) == 0: #no month m and year y in time index of df
+        return 0
+
+    ##find second highest value
+    count = 0
+    m1 = m2 = -1
+    for x in VRM_list:
+        count += 1
+        if x > m2:
+            if x >= m1:
+                m1, m2 = x, m1
+            else:
+                m2 = x
+
+    VRM = m2
+
+    return VRM
+
+
+def check_neg_in_list_series_and_correct(s, method):
+#####Check for Neg Values in Forecast due to Seasonality##########
+
+    if isinstance(s, pd.DataFrame):
+        Is_Df = True
+        #s = s['seasonal_naive+seasonal']
+        s = s['drift+seasonal']
+
+    else:
+        Is_Df = False
+    if method == '0_force': # if neg value, replace with 0 (for big slope forecasts)
+        for index, value in s.iteritems():
+            if value < 0:
+                s.loc[index] = 0.1
+    elif method == 'offset': # find offset to shift whole forecast to make it positive
+        neg = 0
+        for index, value in s.iteritems():
+            if value < neg:
+                neg = value
+        #shift series
+        s = s - neg + 0.1
+    if Is_Df:
+        return s.to_frame()
+    else:
+        return s
+
+
+def check_neg_in_list(l):
+    for x in l:
+        if x < 0:
+            return True
+    return False
+
+
+def savefile_droppedcells(CODE_NIDT_list, file_path):
+    columns = ['Cell']
+    if CODE_NIDT_list:
+        df_droppedcells = pd.DataFrame(CODE_NIDT_list)
+        df_droppedcells.to_csv(file_path + '.csv')
+
+
+def savefile_cellforecasts_neg(CODE_NIDT_list, week_index_list, data_forecast_neg, file_path):
+    columns = ['Method'] + week_index_list
+    if data_forecast_neg:
+        df_forecast_neg = pd.DataFrame(data_forecast_neg, index=CODE_NIDT_list, columns=columns)
+        df_forecast_neg.to_csv(file_path + '.csv')
+
+
+def savefile_cellforecasts_final(CODE_NIDT_list, week_index_list, data_forecast_final, file_path):
+
+    columns = ['Method', 'RMSE_train', 'MAPE_train', 'MAE_train'] + week_index_list
+    if data_forecast_final:
+        df_forecast_final = pd.DataFrame(data_forecast_final, index=CODE_NIDT_list, columns=columns)
+        df_forecast_final.to_csv(file_path + '.csv')
+
+def savefile_cell_hist_forecasts_final(CODE_NIDT_list, week_index_list, data_forecast_final, file_path):
+
+    columns = week_index_list
+    if data_forecast_final:
+        df_forecast_final = pd.DataFrame(data_forecast_final, index=CODE_NIDT_list, columns=columns)
+        df_forecast_final.to_csv(file_path + '.csv')
+
+
+def flatten_list(l):
+    # flatten_list
+    m = []
+    for x in l:
+        for y in x:
+            m.append(y)
+
+    return m
+
+
+def generate_week_index(start_week, f_steps, include):
+
+    year = int(start_week[0:4])
+    week = int(start_week[5:7])
+    week_index_list = []
+    if include: #if true, includes starting week in return list
+        week = week - 1
+    for i in range(0, f_steps):
+        week = week + 1
+        if week == 53:
+            week = 1
+            year = year + 1
+        if week < 10:
+            week_index_list.append(str(year) + 'S0' + str(week))
+        else:
+            week_index_list.append(str(year) + 'S' + str(week))
+
+    return week_index_list
+
+
+def remove_W53(dataf):
+    # drop 53rd week of a year if present and replace week 52 with average of week 53 and week 53:
+    for col in dataf.columns:
+        if 'S53' in col:
+            s53_traffic = dataf.iloc[0][col]
+            col_loc = dataf.columns.get_loc(col)
+            dataf.iloc[0, col_loc - 1] = (dataf.iloc[0, col_loc - 1] + s53_traffic) / 2
+            dataf = dataf.drop([col], axis=1)
+    return dataf
+
+
+def process_zeros(dataf, confidence_bound, confidence_bound_2):
+    # drop first 0 values from series, returns series
+    start0_counter = 0
+    for i in dataf.index:
+        if dataf.loc[i, 'Traffic'] == 0:
+            dataf.drop(i, inplace=True)
+            start0_counter = start0_counter + 1
+        else:
+            break
+
+    # check that all last X values are not null, otherwise transform them to null and drop them in next stage
+    for i in range(len(dataf.index) - 1, len(dataf.index) - 1 - confidence_bound_2, -1):
+        if float(dataf.iloc[i]) == 0.0:
+            for j in range(len(dataf.index) - 1, len(dataf.index) - 1 - confidence_bound_2, -1):
+                dataf.iloc[j] = 0.0
+            break
+
+    # drop last 0 values from series, returns series
+    end0_counter = 0
+    iterator_offset = 0
+    if float(dataf.iloc[len(dataf.index) - 1]) == 0.0:
+        for iterator in range(len(dataf.index) - 1, 0, -1):
+            i = iterator - iterator_offset
+            if float(dataf.iloc[i]) == 0.0:
+                end0_counter = end0_counter + 1
+            else:
+                if float(dataf.iloc[i - confidence_bound]) == 0.0:
+                    end0_counter = end0_counter + 1 + confidence_bound
+                    iterator_offset = iterator_offset + confidence_bound
+                else:
+                    break
+        dataf.drop(dataf.index[len(dataf.index) - end0_counter - confidence_bound: len(dataf.index)], inplace = True)
+
+    dataf = dataf.replace(0.0, np.NaN)
+    dataf = dataf.interpolate(method='linear', limit_area='inside')
+
+    return dataf, start0_counter, end0_counter
+
+
+def gen_train_test(dataf, train_test_ratio):  # Splits training and test sets
+    train_test_break = int(train_test_ratio * len(dataf))
+    if train_test_ratio < 1:
+        train, test = dataf.iloc[:train_test_break], dataf.iloc[train_test_break:]
+    else:  # if train_test_ration=1, train set = test set = whole data set
+        train, test = dataf.iloc[:], dataf.iloc[:]
+    return train, test
+
+
+def train_model(m, model_name, test, train, train_test_ratio, f_steps, method):
+    if 'Exp' in method:
+        model_test = m.predict(start=test.index[0], end=test.index[-1])
+        model_train = m.predict(start=train.index[0], end=train.index[-1])
+        model_forecast = None
+        if train_test_ratio == 1:
+            model_forecast = m.forecast(f_steps)
+
+        smry = None # indicators in summary are evaluated over training set
+        perf = m.performances()  # performance evaluated over training set
+
+    elif 'ARIMA' in method:
+        model_test = m.predict(n_periods=len(test))
+        model_train = m.predict_in_sample(start=0, end=len(train) - 1)
+        model_forecast = None
+        if train_test_ratio == 1:
+            model_forecast = m.predict(n_periods=f_steps)
+        smry = None
+        perf = {'SSE_train': np.sum((model_train - train) ** 2), 'AIC_train': m.aic(), 'AICC_train': m.aicc(),
+                'BIC_train': m.bic()}
+
+
+    # y_true, y_pred = check_arrays(y_true, y_pred)
+    # perf['RMSE_train'] = tools.eval_measures.rmse(model_train, train, axis=0)
+    perf['RMSE_train'] = np.sqrt(np.mean((model_train - train)**2, axis = 0))
+    perf['MAPE_train'] = np.mean(np.abs((train - model_train) / train)) * 100
+    perf['MAE_train'] = np.mean(np.abs(train - model_train))
+    if train_test_ratio < 1:
+        # perf['RMSE_test'] = tools.eval_measures.rmse(model_test, test, axis=0)
+        perf['RMSE_test'] = np.sqrt(np.mean((model_test - test) ** 2, axis=0))
+        perf['MAPE_test'] = np.mean(np.abs((test - model_test) / test)) * 100
+        perf['SSE_test'] = np.sum((model_test - test) ** 2)
+        perf['MAE_test'] = np.mean(np.abs(test - model_test))
+
+    model_obj = Model(m, model_name, model_test, model_train, model_forecast, smry, perf)
+
+    return model_obj
+
+
+def stl_decompose(dataf, train_test_ratio, seasonal_period, f_steps, multiplicative, is_seasonal, graph, DATA_FRAC_LO):# 52 min input length for seasonality
+
+    #fast prediction using stl decomposition
+    #Ref: https://pypi.org/project/stldecompose/#description
+    start = time.time()
+    if multiplicative:
+        dataf = np.log(dataf)
+    train, test = gen_train_test(dataf, train_test_ratio)
+    train_stl = stl_decomp.decompose(train, seasonal_period, DATA_FRAC_LO)
+
+    '''
+    pyplot.subplot(3, 1, 1)
+    pyplot.plot(train_stl.seasonal)
+    pyplot.title('Seasonal')
+
+    pyplot.subplot(3, 1, 2)
+    pyplot.plot(train_stl.trend)
+    pyplot.title('Trend')
+
+    pyplot.subplot(3, 1, 3)
+    pyplot.plot(train_stl.resid)
+    pyplot.title('Residual')
+    
+    pyplot.show()
+    '''
+
+    model_train = train_stl.trend + train_stl.seasonal
+    model_test = stl_decomp.forecast(train_stl, steps=len(test), fc_func=drift, seasonal=is_seasonal)
+    model_forecast = None
+    if train_test_ratio == 1:
+        model_forecast = stl_decomp.forecast(train_stl, steps=f_steps, fc_func=drift, seasonal=is_seasonal)
+
+    if multiplicative:
+        train = np.exp(train)
+        test = np.exp(test)
+        model_train = np.exp(model_train)
+        model_test = np.exp(model_test)
+        if model_forecast is not None:
+            model_forecast = np.exp(model_forecast)
+
+    perf = {'RMSE_train': np.sqrt(np.mean((model_train - train)**2, axis=0)),
+            'MAPE_train': np.mean(np.abs((train - model_train) / train)) * 100,
+            'MAE_train': np.mean(np.abs(train - model_train))}
+    if train_test_ratio < 1:
+        perf['RMSE_test'] = np.sqrt(np.mean((model_test - test)**2, axis=0))
+        perf['MAPE_test'] = np.mean(np.abs((test - model_test) / test)) * 100
+        perf['SSE_test'] = np.sum((model_test - test) ** 2)
+        perf['MAE_test'] = np.mean(np.abs(test - model_test))
+
+    model_obj = Model(trained_model=train_stl, name='STL_Forecast', model_test=model_test, model_train=model_train,
+                      model_forecast=model_forecast, smry=None, perf=perf)
+
+    end = time.time()
+    exec_time = end-start
+    # print "Execution time of STL Decompose Model: {}\n".format(exec_time)
+    return model_obj, exec_time
+
+
+def stl_seasonal_forecast(trained_stl, steps):
+
+    # container for forecast values
+    forecast_array = np.array([])
+
+    # forecast trend
+    # unpack precalculated trend array stl frame
+    trend_array = trained_stl.trend
+    # track index and value of max correlation
+
+    for step in range(steps):
+        forecast_array = np.append(forecast_array, 0)
+    col_name = 'no trend'
+
+    ix_start = trained_stl.observed.index[-1] + pd.Timedelta(1, freq=trained_stl.observed.index.freqstr)
+    forecast_idx = pd.DatetimeIndex(freq=trained_stl.observed.index.freqstr,
+                                    start=ix_start + pd.Timedelta(weeks=1),
+                                    periods=steps)
+
+    seasonal_ix = 0
+    max_correlation = -np.inf
+    # loop over indexes=length of period avgs
+    detrended_array = np.asanyarray(trained_stl.observed - trained_stl.trend).squeeze()
+    for i, x in enumerate(trained_stl.period_averages):
+        # work slices backward from end of detrended observations
+        if i == 0:
+            # slicing w/ [x:-0] doesn't work
+            detrended_slice = detrended_array[-len(trained_stl.period_averages):]
+        else:
+            detrended_slice = detrended_array[-(len(trained_stl.period_averages) + i):-i]
+        # calculate corr b/w period_avgs and detrend_slice
+        this_correlation = np.correlate(detrended_slice, trained_stl.period_averages)[0]
+        if this_correlation > max_correlation:
+            # update ix and max correlation
+            max_correlation = this_correlation
+            seasonal_ix = i
+    # roll seasonal signal to matching phase
+    rolled_period_averages = np.roll(trained_stl.period_averages, -seasonal_ix)
+    # tile as many time as needed to reach "steps", then truncate
+    tiled_averages = np.tile(rolled_period_averages,
+                             (steps // len(trained_stl.period_averages) + 1))[:steps]
+    # add seasonal values to previous forecast
+    forecast_array += tiled_averages
+    col_name += '+seasonal'
+
+    # combine data array with index into named dataframe
+    forecast_frame = pd.DataFrame(data=forecast_array, index=forecast_idx)
+    forecast_frame.columns = [col_name]
+    return forecast_frame
+
+
+def ExpSmoothing_Models(exp_type, dataf, train_test_ratio, seasonal_period, f_steps, graph):
+    # Ref: https: // www.statsmodels.org / dev / _modules / statsmodels / tsa / holtwinters.html
+    # exp_type:  list of models to be evaluated
+    # df: history data
+    # train_test_ratio: splits train and test set
+    # seasonal_period: number of seasonal periods
+    # f_steps: number of future forecasting steps
+    # graph: boolean yes/no
+    # test: test set
+    # train: training set
+    # model_test: trained model over test set interval
+    # model_train: trained model over training set interval
+    # model_forecast: forecasting beyond the data history provided
+    # perf: summary output of exp_models performances
+
+    start_all = time.time()
+    models_list = []
+    train, test = gen_train_test(dataf, train_test_ratio)
+
+    if 'Simple_Exp' in exp_type:
+        start = time.time()
+        model = exps.SimpleExpSmoothing(train).fit()
+        models_list.append(train_model(model, 'Simple_Exp', test, train, train_test_ratio, f_steps, method='Exp'))
+        end = time.time()
+        # print "Execution time of Simple_Exp: {}\n".format(end - start)
+
+    if 'Holt_Lin' in exp_type:
+        start = time.time()
+        model = exps.Holt(train, exponential=False, damped=False).fit(optimized=True)
+        models_list.append(train_model(model, 'Holt_Lin', test, train, train_test_ratio, f_steps, method='Exp'))
+        end = time.time()
+        # print "Execution time of Holt_Lin: {}\n".format(end - start)
+
+    if 'Holt_Exp' in exp_type:
+        start = time.time()
+        model = exps.Holt(train, exponential=True, damped=False).fit(optimized=True)
+        models_list.append(train_model(model, 'Holt_Exp', test, train, train_test_ratio, f_steps, method='Exp'))
+        end = time.time()
+        # print "Execution time of Holt_Exp: {}\n".format(end - start)
+
+    if 'Holt_Damp' in exp_type:
+        start = time.time()
+        model = exps.Holt(train, exponential=False, damped=True).fit(optimized=True)
+        models_list.append(train_model(model, 'Holt_Damp', test, train, train_test_ratio, f_steps, method='Exp'))
+        end = time.time()
+        # print "Execution time of Holt_Damp: {}\n".format(end - start)
+
+    if 'Holt_Exp_Damp' in exp_type:
+        start = time.time()
+        model = exps.Holt(train, exponential=True, damped=True).fit(optimized=True)
+        models_list.append(train_model(model, 'Holt_Exp_Damp', test, train, train_test_ratio, f_steps, method='Exp'))
+        end = time.time()
+        # print "Execution time of Holt_Exp_Damp: {}\n".format(end - start)
+
+    if 'Holt_Winters_Seasonal_A_A' in exp_type:
+        # trend can be: additive, multiplicative or None
+        # damped can be: True or False:
+        # seasonal can be: additive, multiplicative or None
+        # seasonal_periods: granularity of data (52 if weekly , 12 if monthly, etc)
+        # use_boxcox can be: True, False, 'log', or float
+        # models_list: a list of Model objects of class Model
+        start = time.time()
+        model = exps.ExponentialSmoothing(train, trend='additive', damped=False, seasonal='additive',
+                                          seasonal_periods=seasonal_period).fit(optimized=True, use_boxcox=False,
+                                                                                remove_bias=False,
+                                                                                use_basinhopping=False)
+        models_list.append(train_model(model, 'Holt_Winters_Seasonal_A_A', test, train, train_test_ratio, f_steps,
+                                       method='Exp'))
+        end = time.time()
+        # print "Execution time of Holt_Winters_Seasonal_A_A: {}\n".format(end - start)
+
+    if 'Holt_Winters_Seasonal_A_M' in exp_type:
+        start = time.time()
+        model = exps.ExponentialSmoothing(train, trend='additive', damped=False, seasonal='multiplicative',
+                                          seasonal_periods=seasonal_period).fit(optimized=True, use_boxcox=False,
+                                                                                remove_bias=False,
+                                                                                use_basinhopping=False)
+        models_list.append(train_model(model, 'Holt_Winters_Seasonal_A_M', test, train, train_test_ratio, f_steps,
+                                       method='Exp'))
+        end = time.time()
+        # print "Execution time of Holt_Winters_Seasonal_A_M: {}\n".format(end - start)
+
+    if 'Holt_Winters_Seasonal_Ad_A' in exp_type:
+        start = time.time()
+        model = exps.ExponentialSmoothing(train, trend='additive', damped=True, seasonal='additive',
+                                          seasonal_periods=seasonal_period).fit(optimized=True, use_boxcox=False,
+                                                                                remove_bias=False,
+                                                                                use_basinhopping=False)
+        models_list.append(train_model(model, 'Holt_Winters_Seasonal_Ad_A', test, train, train_test_ratio, f_steps,
+                                       method='Exp'))
+        end = time.time()
+        # print "Execution time of Holt_Winters_Seasonal_Ad_A: {}\n".format(end - start)
+
+    if 'Holt_Winters_Seasonal_Ad_M' in exp_type:
+        start = time.time()
+        model = exps.ExponentialSmoothing(train, trend='additive', damped=True, seasonal='multiplicative',
+                                          seasonal_periods=seasonal_period).fit(optimized=True, use_boxcox=False,
+                                                                                remove_bias=False,
+                                                                                use_basinhopping=False)
+        models_list.append(train_model(model, 'Holt_Winters_Seasonal_Ad_M', test, train, train_test_ratio, f_steps,
+                                       method='Exp'))
+        end = time.time()
+        # print "Execution time of Holt_Winters_Seasonal_Ad_M: {}\n".format(end - start)
+
+    if 'Holt_Winters_Seasonal_M_A' in exp_type:
+        start = time.time()
+        model = exps.ExponentialSmoothing(train, trend='multiplicative', damped=False, seasonal='additive',
+                                          seasonal_periods=seasonal_period).fit(optimized=True, use_boxcox=False,
+                                                                                remove_bias=False,
+                                                                                use_basinhopping=False)
+        models_list.append(train_model(model, 'Holt_Winters_Seasonal_M_A', test, train, train_test_ratio, f_steps,
+                                       method='Exp'))
+        end = time.time()
+        # print "Execution time of Holt_Winters_Seasonal_M_A: {}\n".format(end - start)
+
+    if 'Holt_Winters_Seasonal_M_M' in exp_type:
+        start = time.time()
+        model = exps.ExponentialSmoothing(train, trend='multiplicative', damped=False, seasonal='multiplicative',
+                                          seasonal_periods=seasonal_period).fit(optimized=True, use_boxcox=False,
+                                                                                remove_bias=False,
+                                                                                use_basinhopping=False)
+        models_list.append(train_model(model, 'Holt_Winters_Seasonal_M_M', test, train, train_test_ratio, f_steps,
+                                       method='Exp'))
+        end = time.time()
+        # print "Execution time of Holt_Winters_Seasonal_M_M: {}\n".format(end - start)
+
+    if 'Holt_Winters_Seasonal_Md_A' in exp_type:
+        start = time.time()
+        model = exps.ExponentialSmoothing(train, trend='multiplicative', damped=True, seasonal='additive',
+                                          seasonal_periods=seasonal_period).fit(optimized=True, use_boxcox=False,
+                                                                                remove_bias=False,
+                                                                                use_basinhopping=False)
+        models_list.append(train_model(model, 'Holt_Winters_Seasonal_Md_A', test, train, train_test_ratio, f_steps,
+                                       method='Exp'))
+        end = time.time()
+        # print "Execution time of Holt_Winters_Seasonal_Md_A: {}\n".format(end - start)
+
+    if 'Holt_Winters_Seasonal_Md_M' in exp_type:
+        start = time.time()
+        model = exps.ExponentialSmoothing(train, trend='multiplicative', damped=True, seasonal='multiplicative',
+                                          seasonal_periods=seasonal_period).fit(optimized=True, use_boxcox=False,
+                                                                                remove_bias=False,
+                                                                                use_basinhopping=False)
+        models_list.append(train_model(model, 'Holt_Winters_Seasonal_Md_M', test, train, train_test_ratio, f_steps,
+                                       method='Exp'))
+        end = time.time()
+        # print "Execution time of Holt_Winters_Seasonal_Md_M: {}\n".format(end - start)
+    '''
+    model_test = model.predict(start=test.index[0], end=test.index[-1])
+    model_train = model.predict(start=train.index[0], end=train.index[-1])
+    if train_test_ratio==1:
+        forecast = model.forecast(f_steps)
+
+    smry = model.summary()          #indicators in summary are evalyated over training set
+    perf = model.performances()     #performance evaluated over training set
+    # y_true, y_pred = check_arrays(y_true, y_pred)
+    # perf['RMSE_train'] = stm.tools.eval_measures.rmse(model_train, train, axis=0)
+    perf['RMSE_train'] = np.sqrt(np.mean((model_train - train)**2, axis = 0))
+    perf['MAPE_train'] = np.mean(np.abs((train - model_train) / train)) * 100
+    if train_test_ratio==1:
+        # perf['RMSE_test'] = stm.tools.eval_measures.rmse(model_test, test, axis=0)
+        perf['RMSE_test'] = np.sqrt(np.mean((model_test - test)**2, axis = 0))
+        perf['MAPE_test'] = np.mean(np.abs((test - model_test) / test)) * 100
+        perf['SSE_test'] = np.sum((model_test - test)**2)
+
+    '''
+    '''
+    if graph:
+        pyplot.plot(train.index, train, label='Train')
+        if train_test_ratio==1:
+            pyplot.plot(forecast.index, forecast, label=exp_type)
+        else:
+            pyplot.plot(test.index, test, label='Test')
+            pyplot.plot(model_test.index, test, label=exp_type)
+        pyplot.plot(model_train.index, model_train, label=exp_type)
+        pyplot.legend(loc='best')
+        pyplot.show()
+        return model_test, model_train, smry, perf
+    '''
+    end_all = time.time()
+    exec_time = end_all - start_all
+    # print "Execution time of All Exp Models: {}\n".format(exec_time)
+
+    return models_list, exec_time
+
+
+def run_fitonly(df, INPUT_RATIO, Y_Nm1, M_Nm1, Y_N, M_N, FORECASTING_STEPS, file_output_location, file_cache_location, instance_id):
+
+
+    INPUT_RATIO = INPUT_RATIO
+    Y_Nm1 = Y_Nm1
+    M_Nm1 = M_Nm1
+    Y_N = Y_N
+    M_N = M_N
+    FORECASTING_STEPS = FORECASTING_STEPS
+
+    if FORECASTING_STEPS == 0 or FORECASTING_STEPS == '':
+        print('PLEASE SPECIFY FORECASTING STEPS, MIN VALUE: 1')
+        sys.exit()
+
+    if INPUT_RATIO is None:
+        INPUT_RATIO = 0
+    else:
+        INPUT_RATIO = float(INPUT_RATIO)
+        if Y_Nm1 is None or M_Nm1 is None or Y_N is None or M_N is None:
+            print('ERROR PLEASE SPECIFY INPUT SOURCE AND TARGET MONTH AND YEAR FOR FORECAST FITTING')
+            sys.exit()
+
+    data_history_forecast_final = df.values.tolist()
+    for l in data_history_forecast_final:
+        l.pop(0)
+    hist_len = len(df.columns) - 1 - FORECASTING_STEPS  ##
+    first_hist_week = df.columns[1]
+    last_hist_week = df.columns[hist_len]
+    sing_day, sing_year = start_weekday_tune(first_hist_week, last_hist_week)
+
+    week_index_list_hist_forecast = generate_week_index(first_hist_week, FORECASTING_STEPS + hist_len, True)
+
+    week_index_list1 = [val + '-' + str(sing_day) for val in week_index_list_hist_forecast]
+
+    df_index = generate_datetime_index(pd.Series(week_index_list1), sing_day, sing_year)
+    df_index = df_index - pd.Timedelta(days=0)
+
+    df_history_forecast_final = pd.DataFrame(data_history_forecast_final, index=df['ENODEB'], columns=df_index)
+
+
+    if INPUT_RATIO > 0.0:
+
+        VRMs_Nm1 = find_VRM(df_history_forecast_final, M_Nm1, Y_Nm1)
+        VRMs_N = find_VRM(df_history_forecast_final, M_N, Y_N)
+
+        if VRMs_N != 0 and VRMs_Nm1 != 0:
+            # Fit_Ratio = sum(VRMs_Nm1) * (1 + float(INPUT_RATIO)/100) / sum(VRMs_N)
+            Fit_Ratio = VRMs_Nm1 * (1 + INPUT_RATIO / 100) / VRMs_N
+
+            data_history_forecast_final_fitted = []
+            for v in data_history_forecast_final:
+                l = [x * Fit_Ratio for x in v[hist_len:]]
+                data_history_forecast_final_fitted.append(v[0:hist_len] + l)
+
+
+    savefile_cell_hist_forecasts_final(df['ENODEB'], week_index_list_hist_forecast,
+                                       data_history_forecast_final,
+                                       file_output_location + "Hist_Forecasts")
+
+    ##SAVE IN CACHE#####
+    savefile_cell_hist_forecasts_final(df['ENODEB'], week_index_list_hist_forecast,
+                                       data_history_forecast_final,
+                                       file_cache_location + "Hist_Forecasts_" + instance_id)
+
+
+    if INPUT_RATIO > 0.0:
+        savefile_cell_hist_forecasts_final(df['ENODEB'], week_index_list_hist_forecast,
+                                           data_history_forecast_final_fitted,
+                                           file_output_location + "Fitted_Hist_Forecasts")
+
+    return
+
+
+# CSON FUNCTIONS
+def GetEventTypes():
+    """Return a list of trigger types"""
+    return []
+
+
+def GetDesc():
+    """Return the description of this mdule"""
+    return "Juve Traffic Forecast Module"
+
+
+def GetVersion():
+    return __version__
+
+
+
+
+# ================================================== MAIN ============================================================#
+# system arguments are in the following order:
+#0 script name by default
+#1 Mode: Forecast_Fit or Fit
+#2 Forecasting Horizon e.g. 52
+#3 Input File Forecast_Fit: path to file
+#4 Input File Fit: path fot file
+#5 Input Trend % : number
+#6 Year of Source month: e.g. 2018
+#7 Number of Source month: e.g. 12
+#8 Year of Target month: e.g. 2019
+#9 Number of Target month: e.g. 12
+#10 Seasonality Mode: AUTO - MANUAL - MIXED
+#11 RANDim instance_id: number
+#12 RANDim cache location for output file
+#13 RANDim user output location for output file
+
+
+print(np.__version__)
+print(np)
+
+start_main = time.time()
+
+STL_DECOMPOSE = False
+HomeMade = True
+
+END_COUNTER_CONFIDENCE_BOUND = 5
+END0_CONFIDENCE_BOUND = 2 #remove 2 counter reports before the 0 counter reports at the end of the series
+FORECASTING_STEPS = int(sys.argv[2])
+print(FORECASTING_STEPS)
+print type(FORECASTING_STEPS)
+SEASONAL_PERIODS = 52
+TRAIN_TEST_RATIO = 1
+TRANSFORM = True
+
+DATA_FRAC_LO = 0.9 #fraction of hist data used for STl decompose - 0.6 default
+
+input_file_fit = sys.argv[4]
+input_file_forecast_fit = sys.argv[3]
+INPUT_RATIO = sys.argv[5]
+Y_Nm1 = sys.argv[6]
+M_Nm1 = sys.argv[7]
+Y_N = sys.argv[8]
+M_N = sys.argv[9]
+SEAS_MOD = sys.argv[10]
+MOD = sys.argv[1]
+instance_id = sys.argv[11]
+file_cache_location = sys.argv[12]
+file_output_location = sys.argv[13]
+
+
+if INPUT_RATIO == '':
+    INPUT_RATIO = -999.99
+else:
+    try:
+        INPUT_RATIO = float(INPUT_RATIO)
+    except ValueError:
+        print('Input Trend % Value Error!')
+        sys.exit()
+
+    if Y_Nm1 is None or M_Nm1 is None or Y_N is None or M_N is None:
+        print('ERROR PLEASE SPECIFY INPUT SOURCE AND TARGET MONTH AND YEAR FOR FORECAST FITTING')
+        sys.exit()
+
+
+
+if (MOD == "Fit"):
+    print('FIT MODE STARTED')
+
+    if os.path.isfile(input_file_fit):
+        ###file exists in input
+        df_fit = pd.read_csv(input_file_fit, sep=';', header=0)
+    elif os.path.isfile(file_cache_location + "Hist_Forecasts_" + instance_id + ".csv"):
+        ###file exists in cache
+        df_fit = pd.read_csv(file_cache_location + "Hist_Forecasts_" + instance_id + ".csv", sep=',', header=0)
+        df_fit.rename(columns={'Unnamed: 0': 'ENODEB'}, inplace=True)
+    else:
+        print("ERROR! No File in Cache - No File in Input - Exit Module")
+        sys.exit()
+
+    run_fitonly(df_fit, INPUT_RATIO, Y_Nm1, M_Nm1, Y_N, M_N, FORECASTING_STEPS, file_output_location, file_cache_location, instance_id)
+
+    sys.exit()
+
+
+
+
+if FORECASTING_STEPS == 0 or FORECASTING_STEPS == '':
+    print('PLEASE SPECIFY FORECASTING STEPS, MIN VALUE: 1')
+    sys.exit()
+
+
+data_RMSE = []
+data_MAPE = []
+data_MAE = []
+data_AIC = []
+
+VRMs_Nm1 = []
+VRMs_N = []
+data_forecast_Holt_STL = []
+
+data_forecast_final = [] #final output file with seasonal and none seasonal inputs
+data_history_forecast_final = []
+data_forecast_neg = []
+data_forecast_final_fitted = []
+
+CODE_NIDT_list_seasonal = []
+CODE_NIDT_list_none_seasonal = []
+CODE_NIDT_list_shorthist = []
+CODE_NIDT_list_negforecast = []
+CODE_NIDT_list_no_drop = []
+CODE_NIDT_list_drop = []
+CODE_NIDT_list_duplicate = []
+
+timer_stl = 0
+avg_hmmd_time = 0
+avg_holtlin_time = 0
+avg_stl_time = 0
+avg_simpleexp_time = 0
+
+# df = pd.read_csv('train_sample_torinolike_2y.csv', sep=';', header=0)
+df = pd.read_csv(input_file_forecast_fit, sep=';', header=0)
+
+#df_cache = pd.read_csv(script_data.GetUserCacheLoc() + "Forecasts.csv", sep=',', header=0)
+
+CODE_NIDT_list = df['ENODEB'].tolist()
+#CODE_NIDT_list = ['00000160H1']
+
+dropped_0input = 0
+dropped_dupinput = 0
+
+simpleexp_start = 0
+simpleexp_end = 0
+
+holtlin_start = 0
+holtlin_end = 0
+
+start_hmmd = 0
+end_hmmd = 0
+
+weekday_tuned = False
+
+for CODE_NIDT in CODE_NIDT_list:
+
+    print(CODE_NIDT)
+    Forecast_success = False
+    success, df_target, hist_len, first_hist_week, last_hist_week, input_seasonality, input_season_intensity = extract_df(df, CODE_NIDT)
+
+    #df_target.fillna(0, inplace=True)
+	
+    if not success:
+        continue
+	
+    if input_seasonality == 'ETE':
+        input_season_week_range = range(29,33,1) #week 29 to week 32
+
+    elif input_seasonality == 'HIVER':
+        input_season_week_range = range(6, 10, 1) #week 6 to week 9
+	
+    elif input_seasonality != '': #having format x-y
+        l = input_seasonality.split('_')
+        input_season_week_range = range(int(l[0]), int(l[1]) + 1, 1)  # week 6 to week 9
+        if input_season_week_range[0] < 1 or input_season_week_range[-1] > 52 or input_season_week_range[0] >= input_season_week_range[-1]:
+            print("WARNING! Incorrect manual seasonality week range")
+            continue
+
+    week_index_list = generate_week_index(first_hist_week, FORECASTING_STEPS + hist_len, True)
+    last_hist_year = last_hist_week[0:4]
+    last_forecast_year = week_index_list[-1][0:4]
+    forecast_years = range(int(last_hist_year), int(last_forecast_year) + 1, 1)
+
+    weeks_list = df_target.index
+
+    no_zeros = 0
+    for v in np.asarray(df_target):
+        if int(v) == 0:
+            no_zeros = no_zeros + 1
+    # if no_zeros > len(np.asarray(df_target['Traffic'])) - 10: #to be adaoted
+    if no_zeros >= len(np.asarray(df_target)) - END0_CONFIDENCE_BOUND:  # to be adapted
+        dropped_0input = dropped_0input + 1
+        CODE_NIDT_list_drop = CODE_NIDT_list_drop + [CODE_NIDT]
+        continue
+
+    # dataframe without date comumn
+    df_target.columns = ['Traffic']
+    df_target['Date'] = df_target.index
+    df_target = df_target[['Date', 'Traffic']]
+
+
+    ######### Find average history traffic in season period##################
+    if SEAS_MOD != 'AUTO' and input_seasonality != '':
+        avg_seas_Nm1 = 0
+        manual_seas_in_hist = False
+
+        if str(forecast_years[0]) + 'S' + str(input_season_week_range[0]).zfill(2) in df_target.index and str(
+                forecast_years[0]) + 'S' + str(input_season_week_range[-1]).zfill(2) in df_target.index:
+            subseries_season = df_target['Traffic'].loc[str(forecast_years[0]) + 'S' + str(input_season_week_range[0]).zfill(2):
+                                                        str(forecast_years[0]) + 'S' + str(
+                                                            input_season_week_range[-1]).zfill(2)]
+            avg_seas_Nm1 = subseries_season.sum() / len(subseries_season)
+            manual_seas_in_hist = True
+            #if avg_seas_Nm1 > 0:
+            #    is_peak = check_peak(df_target, forecast_years[0], input_season_week_range, 2, avg_seas_Nm1)
+
+        if avg_seas_Nm1 == 0 \
+                and str(forecast_years[0] - 1) + 'S' + str(input_season_week_range[0]).zfill(2) in df_target.index \
+                and str(forecast_years[0] - 1) + 'S' + str(input_season_week_range[-1]).zfill(2) in df_target.index :
+            subseries_season = df_target['Traffic'].loc[
+                               str(forecast_years[0] - 1) + 'S' + str(input_season_week_range[0]).zfill(2):
+                               str(forecast_years[0] - 1) + 'S' + str(
+                                   input_season_week_range[-1]).zfill(2)]
+            avg_seas_Nm1 = subseries_season.sum() / len(subseries_season)
+            manual_seas_in_hist = True
+            #if avg_seas_Nm1 > 0:
+            #    is_peak = check_peak(df_target, forecast_years[0] - 1, input_season_week_range, 2, avg_seas_Nm1)
+
+        if avg_seas_Nm1 == 0 \
+                and str(forecast_years[0] - 2) + 'S' + str(input_season_week_range[0]).zfill(2) in df_target.index \
+                and str(forecast_years[0] - 2) + 'S' + str(input_season_week_range[-1]).zfill(2) in df_target.index :
+            subseries_season = df_target['Traffic'].loc[
+                               str(forecast_years[0] - 2) + 'S' + str(input_season_week_range[0]).zfill(2):
+                               str(forecast_years[0] - 2) + 'S' + str(
+                                   input_season_week_range[-1]).zfill(2)]
+            avg_seas_Nm1 = subseries_season.sum() / len(subseries_season)
+            manual_seas_in_hist = True
+            #if avg_seas_Nm1 > 0:
+            #    is_peak = check_peak(df_target, forecast_years[0] - 1, input_season_week_range, 2, avg_seas_Nm1)
+
+        if not manual_seas_in_hist:
+            print("WARNING! can't find manual seasonality period in history")
+            input_season_intensity = ''
+
+        if avg_seas_Nm1 == 0:
+            print("WARNING! null average traffic in seasonality period in history")
+            input_season_intensity = ''
+            input_seasonality = ''
+
+
+    ###setting time stamp index:
+
+    if not weekday_tuned:
+        sing_day, sing_year = start_weekday_tune(first_hist_week, last_hist_week)
+        print("/////WEEK STARTS ON DAY: " + str(
+            sing_day) + " /////Weekday as a decimal number, where 0 is Sunday and 6 is Saturday.")
+        weekday_tuned = True
+    else:
+        pass
+
+    df_target.index = generate_datetime_index(df_target.Date.astype(str).add('-' + str(sing_day)), sing_day,
+                                              sing_year)
+    df_target.index = df_target.index - pd.Timedelta(days=0)  # resample to set frequency
+    df_target.drop('Date', axis=1, inplace=True)
+
+    '''
+    df_target.index = pd.to_datetime(df_target.Date.astype(str).add('-0'), format='%YS%W-%w')
+    df_target.index = df_target.index - pd.Timedelta(weeks=1) + pd.Timedelta(days=1)
+    df_target.drop('Date', axis = 1, inplace = True)
+    '''
+# =========================================== PRE-PROCESSING =========================================================#
+
+    traffic_hist_raw = df_target['Traffic']
+    # process zeros
+    df_target, start0_counter, end0_counter = process_zeros(df_target, END0_CONFIDENCE_BOUND, END_COUNTER_CONFIDENCE_BOUND)
+    if end0_counter > 0:
+        final_end0_counter = end0_counter + END0_CONFIDENCE_BOUND
+    else:
+        final_end0_counter = end0_counter
+    final_start0_counter = start0_counter
+    while end0_counter > 0 and len(df_target['Traffic']) > 5:
+        df_target, start0_counter, end0_counter = process_zeros(df_target, END0_CONFIDENCE_BOUND, END_COUNTER_CONFIDENCE_BOUND)
+        if end0_counter > 0:
+            final_end0_counter = final_end0_counter + end0_counter + END0_CONFIDENCE_BOUND
+        final_start0_counter = final_start0_counter + start0_counter
+    dropped_start0_list = [0]*final_start0_counter
+    traffic_hist = df_target['Traffic']
+    traffic_hist_m = traffic_hist.resample('MS').sum()
+
+    last_positive_hist_week = weeks_list[len(weeks_list) - final_end0_counter - 1]
+
+    if int(last_positive_hist_week[0:4]) != forecast_years[0]:
+        forecast_years.insert(0, int(last_positive_hist_week[0:4]))
+
+
+
+
+    #short data - no seasonality processing:
+    if len(traffic_hist) <= 5:
+        train, test = gen_train_test(traffic_hist, TRAIN_TEST_RATIO)
+        hist_avg = train.mean()
+        avg_forecast = [train.mean()] * (FORECASTING_STEPS + final_end0_counter)
+        #avg_forecast = np.exp(avg_forecast).tolist()
+
+        forecast_list_final = ['Averaging', 'N/A', 'N/A', 'N/A']
+        forecast_list_final = forecast_list_final + avg_forecast[final_end0_counter:]
+        data_forecast_final.append(forecast_list_final)
+        CODE_NIDT_list_shorthist = CODE_NIDT_list_shorthist + [CODE_NIDT]
+        CODE_NIDT_list_no_drop = CODE_NIDT_list_no_drop + [CODE_NIDT]
+        traffic_hist_raw_forecast = np.asarray(traffic_hist_raw).tolist() + avg_forecast[final_end0_counter:]
+        Forecast_success = True
+
+
+
+
+    elif len(traffic_hist) <= 20 and len(traffic_hist) > 5:
+
+        simpleexp_start = time.time()
+        train, test = gen_train_test(traffic_hist, TRAIN_TEST_RATIO)
+        # holt's method:
+
+        model = exps.SimpleExpSmoothing(train).fit()
+        simpleexp_model = train_model(model, 'Simple_Exp', test, train, TRAIN_TEST_RATIO, FORECASTING_STEPS + final_end0_counter, method='Exp')
+
+        simpleexp_end = time.time()
+        simpleexp_time = simpleexp_end - simpleexp_start
+        avg_simpleexp_time = avg_simpleexp_time + simpleexp_time
+        # print "Best Exp model is {} and has RMSE_train {}\n".format(exp_best_model.model_name,
+        # exp_best_model.perf['RMSE_train'])
+
+
+        #data_forecast_holtlin.append(forecast_list)
+
+        #simpleexp_model.model_forecast = np.exp(simpleexp_model.model_forecast)
+
+        if not check_neg_in_list(np.asarray(simpleexp_model.model_forecast[final_end0_counter:]).tolist()):
+
+            forecast_list_final = ['Simple Exp', simpleexp_model.perf['RMSE_train'], simpleexp_model.perf['MAPE_train'],
+                                   simpleexp_model.perf['MAE_train']]
+            forecast_list_final = forecast_list_final + np.asarray(simpleexp_model.model_forecast[final_end0_counter:]).tolist()
+            data_forecast_final.append(forecast_list_final)
+            CODE_NIDT_list_shorthist = CODE_NIDT_list_shorthist + [CODE_NIDT]
+            CODE_NIDT_list_no_drop = CODE_NIDT_list_no_drop + [CODE_NIDT]
+            traffic_hist_raw_forecast = np.asarray(traffic_hist_raw).tolist() + np.asarray(simpleexp_model.model_forecast[final_end0_counter:]).tolist()
+            Forecast_success = True
+        else:
+            CODE_NIDT_list_negforecast = CODE_NIDT_list_negforecast + [CODE_NIDT]
+            forecast_list_neg = ['Simple Exp'] + np.asarray(simpleexp_model.model_forecast[final_end0_counter:]).tolist()
+            data_forecast_neg.append(forecast_list_neg)
+
+
+
+
+    elif (len(traffic_hist) < SEASONAL_PERIODS * 2 and len(traffic_hist) > SEASONAL_PERIODS) and (SEAS_MOD != 'AUTO' and input_seasonality != ''):
+
+        train, test = gen_train_test(traffic_hist, TRAIN_TEST_RATIO)
+
+        model = exps.Holt(train, exponential=False, damped=False).fit(optimized=True)
+        holtlin_model = train_model(model, 'Holt_Lin', test, train, TRAIN_TEST_RATIO,
+                                    FORECASTING_STEPS + final_end0_counter,
+                                    method='Exp')
+
+        forecast_array = np.asarray(holtlin_model.model_forecast)
+        slope = (forecast_array[len(forecast_array) - 1] - forecast_array[0]) / len(forecast_array)
+
+        if slope > 0:
+
+            method_string = 'Holt Trend + Stl Seasonality < 2Y'
+            unflat_list = False
+
+            ## exp log transform for specific seasonality period
+            STL_model_seas_tr = stl_decomp.decompose(np.log(train), SEASONAL_PERIODS, DATA_FRAC_LO)
+            seasonal_forecast_tr = stl_seasonal_forecast(STL_model_seas_tr, FORECASTING_STEPS + final_end0_counter)
+
+            model_tr = exps.Holt(np.log(train), exponential=False, damped=False).fit(optimized=True)
+            holt_lin_model_tr = train_model(model_tr, 'Holt_Lin', test, train, TRAIN_TEST_RATIO, FORECASTING_STEPS +
+                                            final_end0_counter, method='Exp')
+            forecast_tr = holt_lin_model_tr.model_forecast + seasonal_forecast_tr['no trend+seasonal']
+            forecast_tr = np.exp(forecast_tr)
+
+            STL_model_add = stl_decomp.decompose(train, SEASONAL_PERIODS, DATA_FRAC_LO)
+            seasonal_forecast = stl_seasonal_forecast(STL_model_add, FORECASTING_STEPS + final_end0_counter)
+            forecast = holtlin_model.model_forecast + seasonal_forecast['no trend+seasonal']
+
+            ##join
+            forecast_week_index_list = generate_week_index(last_positive_hist_week,
+                                                           FORECASTING_STEPS + final_end0_counter, False)
+            Holt_STL_model = merge(forecast, forecast_tr, forecast_week_index_list, input_season_week_range)
+
+            ##### verify max seasonal growth intensite and fit
+            if input_season_intensity != '':
+                Holt_STL_model = adapt_intensity(avg_seas_Nm1, Holt_STL_model, forecast_years, input_season_week_range,
+                                                 input_season_intensity)
+
+            #####Check for Neg Values in Forecast due to Seasonality##########
+            Holt_STL_model = check_neg_in_list_series_and_correct(Holt_STL_model, '0_force')
+
+            RMSE_Holt_STL = 'N/A'
+            MAPE_Holt_STL = 'N/A'
+            MAE_Holt_STL = 'N/A'
+
+        else:
+
+            method_string = 'Stl + Input Seasonality < 2Y'
+            unflat_list = False
+
+            ####TSTL Trend Lin Forecast#####
+            '''
+            STL_model_trend, exec_time_a = stl_decompose(train, TRAIN_TEST_RATIO,
+                                                         seasonal_period=SEASONAL_PERIODS,
+                                                         f_steps=FORECASTING_STEPS + 1 + final_end0_counter,
+                                                         multiplicative=False, is_seasonal=False,
+                                                         graph=False)
+
+            STL_model_trend.model_forecast = STL_model_trend.model_forecast.drop(
+                STL_model_trend.model_forecast.index[0])
+            '''
+            STL_model_seas_tr = stl_decomp.decompose(np.log(train), SEASONAL_PERIODS, DATA_FRAC_LO)
+            forecast_tr = stl_decomp.forecast(STL_model_seas_tr,
+                                              steps=FORECASTING_STEPS + final_end0_counter,
+                                              fc_func=drift,
+                                              seasonal=True)
+            forecast_tr = np.exp(forecast_tr)
+
+            STL_model_seas = stl_decomp.decompose(train, SEASONAL_PERIODS, DATA_FRAC_LO)
+            forecast = stl_decomp.forecast(STL_model_seas,
+                                           steps=FORECASTING_STEPS + final_end0_counter,
+                                           fc_func=drift,
+                                           seasonal=True)
+
+            ##join
+            forecast_week_index_list = generate_week_index(last_positive_hist_week,
+                                                           FORECASTING_STEPS + final_end0_counter, False)
+            Holt_STL_model = merge(forecast['drift+seasonal'], forecast_tr['drift+seasonal'], forecast_week_index_list, input_season_week_range)
+
+            #####Check for Neg Values in Forecast due to Seasonality##########
+            Holt_STL_model = check_neg_in_list_series_and_correct(Holt_STL_model, '0_force')
+
+            RMSE_Holt_STL = 'N/A'
+            MAPE_Holt_STL = 'N/A'
+            MAE_Holt_STL = 'N/A'
+
+
+        if unflat_list:
+            forecast_list_final = [method_string, RMSE_Holt_STL, MAPE_Holt_STL, MAE_Holt_STL]
+            if not check_neg_in_list(flatten_list(np.asarray(Holt_STL_model[final_end0_counter:]).tolist())):
+                forecast_list_final = forecast_list_final + flatten_list(np.asarray(Holt_STL_model[final_end0_counter:]).tolist())
+                data_forecast_final.append(forecast_list_final)
+                CODE_NIDT_list_seasonal = CODE_NIDT_list_seasonal + [CODE_NIDT]
+                CODE_NIDT_list_no_drop = CODE_NIDT_list_no_drop + [CODE_NIDT]
+                traffic_hist_raw_forecast = np.asarray(traffic_hist_raw).tolist() + flatten_list(np.asarray(Holt_STL_model[final_end0_counter:]).tolist())
+                Forecast_success = True
+
+            else:
+                CODE_NIDT_list_negforecast = CODE_NIDT_list_negforecast + [CODE_NIDT]
+                forecast_list_neg = [method_string] + flatten_list(np.asarray(Holt_STL_model[final_end0_counter:]).tolist())
+                data_forecast_neg.append(forecast_list_neg)
+        else:
+            forecast_list_final = [method_string, RMSE_Holt_STL, MAPE_Holt_STL, MAE_Holt_STL]
+            if not check_neg_in_list((np.asarray(Holt_STL_model[final_end0_counter:]).tolist())):
+                forecast_list_final = forecast_list_final + np.asarray(Holt_STL_model[final_end0_counter:]).tolist()
+                data_forecast_final.append(forecast_list_final)
+                CODE_NIDT_list_seasonal = CODE_NIDT_list_seasonal + [CODE_NIDT]
+                CODE_NIDT_list_no_drop = CODE_NIDT_list_no_drop + [CODE_NIDT]
+                traffic_hist_raw_forecast = np.asarray(traffic_hist_raw).tolist() + (np.asarray(Holt_STL_model[final_end0_counter:]).tolist())
+                Forecast_success = True
+            else:
+                CODE_NIDT_list_negforecast = CODE_NIDT_list_negforecast + [CODE_NIDT]
+                forecast_list_neg = [method_string] + np.asarray(Holt_STL_model[final_end0_counter:]).tolist()
+                data_forecast_neg.append(forecast_list_neg)
+
+
+
+
+    elif len(traffic_hist) < SEASONAL_PERIODS * 2 or (SEAS_MOD == 'MANUAL' and input_seasonality == ''):
+
+        holtlin_start = time.time()
+        train, test = gen_train_test(traffic_hist, TRAIN_TEST_RATIO)
+        #holt's method:
+
+        model = exps.Holt(train, exponential=False, damped=False).fit(optimized=True)
+        holtlin_model = train_model(model, 'Holt_Lin', test, train, TRAIN_TEST_RATIO, FORECASTING_STEPS + final_end0_counter,
+                                    method='Exp')
+        holtlin_end = time.time()
+        holtlin_time = holtlin_end - holtlin_start
+        avg_holtlin_time = avg_holtlin_time + holtlin_time
+
+        forecast_array = np.asarray(holtlin_model.model_forecast)
+        slope = (forecast_array[len(forecast_array) - 1] - forecast_array[0]) / len(forecast_array)
+
+        if slope > 0:
+
+            forecast_list_final = ['Holt Lin', holtlin_model.perf['RMSE_train'], holtlin_model.perf['MAPE_train'],
+                                   holtlin_model.perf['MAE_train']]
+            forecast_list_final = forecast_list_final + np.asarray(holtlin_model.model_forecast[final_end0_counter:]).tolist()
+            data_forecast_final.append(forecast_list_final)
+            CODE_NIDT_list_none_seasonal = CODE_NIDT_list_none_seasonal + [CODE_NIDT]
+            CODE_NIDT_list_no_drop = CODE_NIDT_list_no_drop + [CODE_NIDT]
+            traffic_hist_raw_forecast = np.asarray(traffic_hist_raw).tolist() + np.asarray(holtlin_model.model_forecast[final_end0_counter:]).tolist()
+            Forecast_success = True
+
+        else:
+
+            ####Try the STL Trend Lin Forecast#####
+            STL_model, exec_time_a = stl_decompose(train, TRAIN_TEST_RATIO, seasonal_period=SEASONAL_PERIODS,
+                                                       f_steps=FORECASTING_STEPS + 1 + final_end0_counter,
+                                                       multiplicative=False, is_seasonal=False,
+                                                       graph=False, DATA_FRAC_LO=DATA_FRAC_LO)
+
+            STL_model.model_forecast = STL_model.model_forecast.drop(STL_model.model_forecast.index[0])
+
+            if not check_neg_in_list(flatten_list(np.asarray(STL_model.model_forecast[final_end0_counter:]).tolist())):
+
+                forecast_list_final = ['STL Trend', 'N/A', 'N/A', 'N/A']
+                forecast_list_final = forecast_list_final + flatten_list(np.asarray(STL_model.model_forecast
+                                                                                    [final_end0_counter:]).tolist())
+                data_forecast_final.append(forecast_list_final)
+                CODE_NIDT_list_none_seasonal = CODE_NIDT_list_none_seasonal + [CODE_NIDT]
+                CODE_NIDT_list_no_drop = CODE_NIDT_list_no_drop + [CODE_NIDT]
+                traffic_hist_raw_forecast = np.asarray(traffic_hist_raw).tolist() + flatten_list(np.asarray(STL_model.model_forecast[final_end0_counter:]).tolist())
+                Forecast_success = True
+
+            else: ####Simple Exp Forecast###
+
+                model = exps.SimpleExpSmoothing(train).fit()
+                simpleexp_model = train_model(model, 'Simple_Exp', test, train, TRAIN_TEST_RATIO,
+                                              FORECASTING_STEPS + final_end0_counter, method='Exp')
+
+                if not check_neg_in_list(np.asarray(simpleexp_model.model_forecast[final_end0_counter:]).tolist()):
+
+                    forecast_list_final = ['Simple Exp After Failed STL Trend', simpleexp_model.perf['RMSE_train'],
+                                           simpleexp_model.perf['MAPE_train'],
+                                           simpleexp_model.perf['MAE_train']]
+                    forecast_list_final = forecast_list_final + np.asarray(simpleexp_model.model_forecast[final_end0_counter:]).tolist()
+                    data_forecast_final.append(forecast_list_final)
+                    CODE_NIDT_list_none_seasonal = CODE_NIDT_list_shorthist + [CODE_NIDT]
+                    CODE_NIDT_list_no_drop = CODE_NIDT_list_no_drop + [CODE_NIDT]
+                    traffic_hist_raw_forecast = np.asarray(traffic_hist_raw).tolist() + np.asarray(simpleexp_model.model_forecast[final_end0_counter:]).tolist()
+                    Forecast_success = True
+
+                else:
+                    CODE_NIDT_list_negforecast = CODE_NIDT_list_negforecast + [CODE_NIDT]
+                    forecast_list_neg = ['Exception: Cannot Forecast'] + flatten_list(np.asarray(STL_model.model_forecast
+                                                                                        [final_end0_counter:]).tolist())
+                    data_forecast_neg.append(forecast_list_neg)
+
+
+
+
+    else:
+
+        # =============================================== STL + HOLT ==================================================#
+        # synchronize stl and exp forecasts
+        # synchronize all forecasts for comparison (including GRX and Torino)
+        start_hmmd = time.time()
+        train, test = gen_train_test(traffic_hist, TRAIN_TEST_RATIO)
+        model = exps.Holt(train, exponential=False, damped=False).fit(optimized=True)
+        holt_lin_model = train_model(model, 'Holt_Lin', test, train, TRAIN_TEST_RATIO, FORECASTING_STEPS +
+                                     final_end0_counter, method='Exp')
+        forecast_array = np.asarray(holt_lin_model.model_forecast)
+        slope = (forecast_array[len(forecast_array) - 1] - forecast_array[0]) / len(forecast_array)
+        if slope < 2 or np.isnan(forecast_array).any():
+
+            if (SEAS_MOD == 'MANUAL') or (SEAS_MOD == 'MIXED' and input_seasonality != ''):
+
+                if input_seasonality == '':
+                    print('ERROR!! Manual and empty seasonality inside Holt Stl method')
+                    sys.exit()
+                ## exo log transform for specific seasonality period
+                method_string = 'Stl + Input Seasonality'
+                unflat_list = False
+
+                ####TSTL Trend Lin Forecast#####
+
+                STL_model_seas_tr = stl_decomp.decompose(np.log(train), SEASONAL_PERIODS, DATA_FRAC_LO)
+                forecast_tr = stl_decomp.forecast(STL_model_seas_tr,
+                                                     steps=FORECASTING_STEPS + final_end0_counter,
+                                                     fc_func=drift,
+                                                     seasonal=True)
+                forecast_tr = np.exp(forecast_tr)
+
+
+                STL_model_seas = stl_decomp.decompose(train, SEASONAL_PERIODS, DATA_FRAC_LO)
+                forecast = stl_decomp.forecast(STL_model_seas,
+                                                     steps=FORECASTING_STEPS + final_end0_counter,
+                                                     fc_func=drift,
+                                                     seasonal=True)
+
+                ##join
+                forecast_week_index_list = generate_week_index(last_positive_hist_week,
+                                                               FORECASTING_STEPS + final_end0_counter, False)
+                Holt_STL_model = merge(forecast['drift+seasonal'], forecast_tr['drift+seasonal'], forecast_week_index_list, input_season_week_range)
+
+
+                ##### verify max seasonal growth intensite and fit
+                if input_season_intensity != '':
+                    Holt_STL_model = adapt_intensity(avg_seas_Nm1, Holt_STL_model, forecast_years, input_season_week_range,
+                                                     input_season_intensity)
+
+                #####Check for Neg Values in Forecast due to Seasonality##########
+                Holt_STL_model = check_neg_in_list_series_and_correct(Holt_STL_model, 'offset')
+
+                RMSE_Holt_STL = 'N/A'
+                MAPE_Holt_STL = 'N/A'
+                MAE_Holt_STL = 'N/A'
+
+
+            else:
+
+                method_string = 'STL'
+                unflat_list = True
+
+                STL_model_add = stl_decomp.decompose(train, SEASONAL_PERIODS, DATA_FRAC_LO)
+                Holt_STL_model = stl_decomp.forecast(STL_model_add,
+                                                     steps=FORECASTING_STEPS + final_end0_counter,
+                                                     fc_func=drift,
+                                                     #fc_func=seasonal_naive,
+                                                     seasonal=True)
+
+                #####Check for Neg Values in Forecast due to Seasonality##########
+                Holt_STL_model = check_neg_in_list_series_and_correct(Holt_STL_model, 'offset')
+
+                '''
+                pyplot.subplot(4, 1, 1)
+                pyplot.plot(STL_model_add.seasonal)
+                pyplot.title('Seasonal')
+
+                pyplot.subplot(4, 1, 2)
+                pyplot.plot(STL_model_add.trend)
+                pyplot.title('Trend')
+
+                pyplot.subplot(4, 1, 3)
+                pyplot.plot(STL_model_add.resid)
+                pyplot.title('Residual')
+
+                pyplot.subplot(4, 1, 4)
+                pyplot.plot(train)
+                pyplot.title('History')
+
+                pyplot.show()
+                '''
+
+                RMSE_Holt_STL = 'N/A'
+                MAPE_Holt_STL = 'N/A'
+                MAE_Holt_STL = 'N/A'
+
+        else:
+
+            if (SEAS_MOD == 'MANUAL') or (SEAS_MOD == 'MIXED' and input_seasonality != ''):
+
+                if input_seasonality == '':
+                    print('ERROR!! Manual end empty seasonality inside Holt Stl method')
+                    sys.exit()
+
+                method_string = 'Holt Trend + Stl Input Seasonality'
+                unflat_list = False
+
+                ## exp log transform for specific seasonality period
+                STL_model_seas_tr = stl_decomp.decompose(np.log(train), SEASONAL_PERIODS, DATA_FRAC_LO)
+                seasonal_forecast_tr = stl_seasonal_forecast(STL_model_seas_tr, FORECASTING_STEPS + final_end0_counter)
+
+                model_tr = exps.Holt(np.log(train), exponential=False, damped=False).fit(optimized=True)
+                holt_lin_model_tr = train_model(model_tr, 'Holt_Lin', test, train, TRAIN_TEST_RATIO, FORECASTING_STEPS +
+                                             final_end0_counter, method='Exp')
+                forecast_tr = holt_lin_model_tr.model_forecast + seasonal_forecast_tr['no trend+seasonal']
+                forecast_tr = np.exp(forecast_tr)
+
+                STL_model_add = stl_decomp.decompose(train, SEASONAL_PERIODS, DATA_FRAC_LO)
+                seasonal_forecast = stl_seasonal_forecast(STL_model_add, FORECASTING_STEPS + final_end0_counter)
+                forecast = holt_lin_model.model_forecast + seasonal_forecast['no trend+seasonal']
+
+                ##join
+                forecast_week_index_list = generate_week_index(last_positive_hist_week, FORECASTING_STEPS + final_end0_counter , False)
+                Holt_STL_model = merge(forecast, forecast_tr, forecast_week_index_list, input_season_week_range)
+
+
+                ##### verify max seasonal growth intensite and fit
+                if input_season_intensity != '':
+                    Holt_STL_model = adapt_intensity(avg_seas_Nm1, Holt_STL_model, forecast_years, input_season_week_range,
+                                                     input_season_intensity)
+
+                Holt_STL_model = check_neg_in_list_series_and_correct(Holt_STL_model, '0_force')
+
+                RMSE_Holt_STL = 'N/A'
+                MAPE_Holt_STL = 'N/A'
+                MAE_Holt_STL = 'N/A'
+
+            else:
+
+                method_string = 'Holt Trend + Stl Seasonality'
+                unflat_list = False
+                STL_model_add = stl_decomp.decompose(train, SEASONAL_PERIODS, DATA_FRAC_LO)
+                seasonal_forecast = stl_seasonal_forecast(STL_model_add, FORECASTING_STEPS + final_end0_counter)
+                Holt_STL_model = holt_lin_model.model_forecast + seasonal_forecast['no trend+seasonal']
+
+                #####Check for Neg Values in Forecast due to Seasonality##########
+                Holt_STL_model = check_neg_in_list_series_and_correct(Holt_STL_model, '0_force')
+
+                RMSE_Holt_STL = 'N/A'
+                MAPE_Holt_STL = 'N/A'
+                MAE_Holt_STL = 'N/A'
+
+        end_hmmd = time.time()
+        hmmd_time = end_hmmd - start_hmmd
+        avg_hmmd_time = avg_hmmd_time + hmmd_time
+
+
+
+        if unflat_list:
+            forecast_list_final = [method_string, RMSE_Holt_STL, MAPE_Holt_STL, MAE_Holt_STL]
+            if not check_neg_in_list(flatten_list(np.asarray(Holt_STL_model[final_end0_counter:]).tolist())):
+                forecast_list_final = forecast_list_final + flatten_list(np.asarray(Holt_STL_model[final_end0_counter:]).tolist())
+                data_forecast_final.append(forecast_list_final)
+                CODE_NIDT_list_seasonal = CODE_NIDT_list_seasonal + [CODE_NIDT]
+                CODE_NIDT_list_no_drop = CODE_NIDT_list_no_drop + [CODE_NIDT]
+                traffic_hist_raw_forecast = np.asarray(traffic_hist_raw).tolist() + flatten_list(np.asarray(Holt_STL_model[final_end0_counter:]).tolist())
+                Forecast_success = True
+
+            else:
+                CODE_NIDT_list_negforecast = CODE_NIDT_list_negforecast + [CODE_NIDT]
+                forecast_list_neg = [method_string] + flatten_list(np.asarray(Holt_STL_model[final_end0_counter:]).tolist())
+                data_forecast_neg.append(forecast_list_neg)
+        else:
+            forecast_list_final = [method_string, RMSE_Holt_STL, MAPE_Holt_STL, MAE_Holt_STL]
+            if not check_neg_in_list((np.asarray(Holt_STL_model[final_end0_counter:]).tolist())):
+                forecast_list_final = forecast_list_final + np.asarray(Holt_STL_model[final_end0_counter:]).tolist()
+                data_forecast_final.append(forecast_list_final)
+                CODE_NIDT_list_seasonal = CODE_NIDT_list_seasonal + [CODE_NIDT]
+                CODE_NIDT_list_no_drop = CODE_NIDT_list_no_drop + [CODE_NIDT]
+                traffic_hist_raw_forecast = np.asarray(traffic_hist_raw).tolist() + (np.asarray(Holt_STL_model[final_end0_counter:]).tolist())
+                Forecast_success = True
+            else:
+                CODE_NIDT_list_negforecast = CODE_NIDT_list_negforecast + [CODE_NIDT]
+                forecast_list_neg = [method_string] + np.asarray(Holt_STL_model[final_end0_counter:]).tolist()
+                data_forecast_neg.append(forecast_list_neg)
+        # print(slope)
+        # print(CODE_NIDT)
+
+        #pyplot.show()
+
+        # plot_forecasts(traffic_hist, TRAIN_TEST_RATIO, None, None, None, None, Holt_STL_model)
+
+
+
+
+    if Forecast_success:
+
+        data_history_forecast_final.append(traffic_hist_raw_forecast)
+
+        ##Plots##
+        '''
+        pyplot.plot(train.index, train, label='Train')
+        if len(forecast_list_final)==1:
+            listo = flatten_list(forecast_list_final)
+            pyplot.plot(pd.date_range(start=train.index[-1] + pd.Timedelta(weeks=1), periods=FORECASTING_STEPS, freq='W'), listo[4:], label='forecast')
+        else:
+            pyplot.plot(pd.date_range(start=train.index[-1] + pd.Timedelta(weeks=1), periods=FORECASTING_STEPS, freq='W'), forecast_list_final[4:], label='forecast')
+        pyplot.legend(loc='best')
+        #pyplot.show()
+        filename = 'Forecast' + str(CODE_NIDT) + '.png'
+        dir = os.path.join(os.path.join(os.getcwd(), 'figures_cson_seasonality'), filename)
+        pyplot.savefig(dir)
+        pyplot.gcf().clear()
+        '''
+
+if data_history_forecast_final:
+
+    week_index_list_hist_forecast = generate_week_index(first_hist_week, FORECASTING_STEPS + hist_len, True)
+
+    week_index_list1 = [val + '-' + str(sing_day) for val in week_index_list_hist_forecast]
+
+    df_index = generate_datetime_index(pd.Series(week_index_list1), sing_day, sing_year)
+    df_index = df_index - pd.Timedelta(days=0)
+
+    '''
+    df_index = pd.to_datetime(week_index_list1, format='%YS%W-%w')
+    df_index = df_index - pd.Timedelta(weeks=1) + pd.Timedelta(days=1)
+    '''
+
+    df_history_forecast_final = pd.DataFrame(data_history_forecast_final, index=CODE_NIDT_list_no_drop, columns=df_index)
+
+
+    if INPUT_RATIO > -999:
+
+        VRMs_Nm1 = find_VRM(df_history_forecast_final, M_Nm1, Y_Nm1)
+        VRMs_N = find_VRM(df_history_forecast_final, M_N, Y_N)
+
+        if VRMs_N != 0 and VRMs_Nm1 != 0:
+            #Fit_Ratio = sum(VRMs_Nm1) * (1 + float(INPUT_RATIO)/100) / sum(VRMs_N)
+            Fit_Ratio = VRMs_Nm1 * (1 + INPUT_RATIO / 100) / VRMs_N
+
+            data_forecast_final_fitted = []
+            data_history_forecast_final_fitted = []
+            counter = 0
+            for v in data_forecast_final:
+
+                l = [x * Fit_Ratio for x in v[4:]]
+                data_forecast_final_fitted.append(v[0:4] + l)
+                data_history_forecast_final_fitted.append(data_history_forecast_final[counter][0:hist_len] + l)
+                counter = counter + 1
+
+        else:
+            print('WARNING!!! VRM of source month or target month is null - no possible fits')
+
+timer_list = []
+columns = []
+columns_AIC = []
+timer_list_AIC = []
+no_cells = len(CODE_NIDT_list)
+
+if STL_DECOMPOSE:
+    columns = columns + ['STL Models']
+    columns = columns + ['STL Add']
+    columns = columns + ['STL Mult']
+    timer_list = timer_list + [timer_stl / no_cells]
+
+if HomeMade:
+    columns = columns + ['Holt STL Models']
+    try:
+        hmmd_time
+    except NameError:
+        pass
+    else:
+        timer_list = timer_list + [hmmd_time / no_cells]
+
+data_RMSE.append(timer_list)
+data_MAPE.append(timer_list)
+data_MAE.append(timer_list)
+data_AIC.append(timer_list_AIC)
+
+##generate week format time index
+week_index_list = generate_week_index(last_hist_week, FORECASTING_STEPS, False)
+
+'''
+savefile_cellforecasts_final(CODE_NIDT_list_no_drop, week_index_list, data_forecast_final,
+                             script_data. GetUserCacheLoc() + "Forecasts")
+'''
+
+savefile_cellforecasts_final(CODE_NIDT_list_no_drop, week_index_list, data_forecast_final,
+                             file_output_location + "Forecasts")
+
+savefile_cell_hist_forecasts_final(CODE_NIDT_list_no_drop, week_index_list_hist_forecast,
+                                   data_history_forecast_final, file_output_location + "Hist_Forecasts")
+
+##SAVE IN CACHE#####
+savefile_cell_hist_forecasts_final(CODE_NIDT_list_no_drop, week_index_list_hist_forecast,
+                                   data_history_forecast_final,
+                                   file_cache_location + "Hist_Forecasts_" + instance_id)
+
+
+if INPUT_RATIO > -999 and VRMs_N != 0 and VRMs_Nm1 != 0:
+
+    savefile_cellforecasts_final(CODE_NIDT_list_no_drop, week_index_list, data_forecast_final_fitted,
+                                 file_output_location + "Fitted_Forecasts")
+
+    savefile_cell_hist_forecasts_final(CODE_NIDT_list_no_drop, week_index_list_hist_forecast,
+                                       data_history_forecast_final_fitted,
+                                       file_output_location + "Fitted_Hist_Forecasts")
+
+savefile_cellforecasts_neg(CODE_NIDT_list_negforecast, week_index_list, data_forecast_neg,
+                           file_output_location + "Forecasts_Error_Cells")
+
+savefile_droppedcells(CODE_NIDT_list_drop, file_output_location + "Dropped_Empty_Entries")
+
+# plot_forecasts(traffic_hist, TRAIN_TEST_RATIO, exp_best_model, None, None, None)
+
+end_main = time.time()
+
+print "Total No. of Input is {}\n".format(len(CODE_NIDT_list))
+
+print "No. of dropped cells is {}\n".format(dropped_0input)
+
+if CODE_NIDT_list_shorthist:
+    print "Avg Exec time of simple_exp is {}\n".format(avg_simpleexp_time/len(CODE_NIDT_list_shorthist))
+
+if CODE_NIDT_list_none_seasonal:
+    print "Avg Exec time of holt_lin is {}\n".format(avg_holtlin_time/len(CODE_NIDT_list_none_seasonal))
+if CODE_NIDT_list_seasonal:
+    print "Avg Exec time of holt_stl is {}\n".format(avg_hmmd_time/len(CODE_NIDT_list_seasonal))
+
+print "Avg Exec time of Cell {}\n".format((end_main - start_main)/(len(CODE_NIDT_list) - dropped_0input))
+
+print "Execution time of Module {}\n".format(end_main - start_main)
+
